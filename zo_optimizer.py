@@ -59,40 +59,51 @@ class ZeroOrderOptimizer:
         optimizer.layer_names = ["fc.weight", "fc.bias"]
     """
 
+    
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
+        lr: float = 5e-2,
         eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
+        perturbation_mode: str = "rademacher",
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
 
-        if perturbation_mode not in ("gaussian", "uniform"):
+        if perturbation_mode not in ("rademacher", "gaussian", "uniform"):
             raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
-                f"got '{perturbation_mode}'"
+                "perturbation_mode must be one of "
+                "'rademacher', 'gaussian', or 'uniform', "
+                f"got {perturbation_mode!r}"
             )
         self.perturbation_mode = perturbation_mode
 
-        # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
-        # ------------------------------------------------------------------
+        # The model is ResNet18 with the final head replaced by nn.Linear(..., 100).
+        # The safest useful target is the classification head.
         self.layer_names: list[str] = ["fc.weight", "fc.bias"]
-        # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Internal helpers — students may modify these.
-    # ------------------------------------------------------------------
+        # SPSA / ES settings.
+        # n_directions=2 means:
+        #   loss_before + 2 * n_directions finite-difference evaluations
+        # = 5 calls to loss_fn() per optimizer step.
+        self.n_directions = 2
+
+        # Adam-like state for noisy ZO estimates.
+        self.step_idx = 0
+        self.beta1 = 0.9
+        self.beta2 = 0.99
+        self.adam_eps = 1e-8
+
+        self.m: dict[str, torch.Tensor] = {}
+        self.v: dict[str, torch.Tensor] = {}
+
+        # Prevent one noisy estimate from destroying the head.
+        self.max_update_norm = 1.0
+
+        # Mild regularization for fc.weight only.
+        self.weight_decay = 1e-4
+
 
     def _active_params(self) -> dict[str, nn.Parameter]:
         """Return a mapping from name → parameter for all active layer names.
@@ -108,14 +119,24 @@ class ZeroOrderOptimizer:
                       model.
         """
         named = dict(self.model.named_parameters())
-        missing = [n for n in self.layer_names if n not in named]
+
+        # Remove accidental duplicates while preserving order.
+        unique_names: list[str] = []
+        seen: set[str] = set()
+        for name in self.layer_names:
+            if name not in seen:
+                unique_names.append(name)
+                seen.add(name)
+
+        missing = [name for name in unique_names if name not in named]
         if missing:
+            valid = [name for name, _ in self.model.named_parameters()]
             raise KeyError(
-                f"The following layer names were not found in the model: "
-                f"{missing}. Use [n for n, _ in model.named_parameters()] "
-                f"to inspect valid names."
+                f"Layer names not found: {missing}. "
+                f"Available parameter names are: {valid}"
             )
-        return {n: named[n] for n in self.layer_names}
+
+        return {name: named[name] for name in unique_names}
 
     def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
         """Sample a random unit-norm perturbation vector of the same shape as ``param``.
@@ -126,15 +147,14 @@ class ZeroOrderOptimizer:
         Returns:
             A tensor of the same shape as ``param``, normalised to unit L2 norm.
         """
-        if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
+        if self.perturbation_mode == "rademacher":
+            return torch.empty_like(param).bernoulli_(0.5).mul_(2.0).sub_(1.0)
 
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
-        return u
+        if self.perturbation_mode == "gaussian":
+            return torch.randn_like(param)
+
+        # Uniform with approximately unit variance.
+        return (torch.rand_like(param) * 2.0 - 1.0) * math.sqrt(3.0)
 
     def _estimate_grad(
         self,
@@ -168,31 +188,46 @@ class ZeroOrderOptimizer:
         Student task:
             Replace this with a more efficient or accurate estimator:
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+        grads = {
+            name: torch.zeros_like(param)
+            for name, param in params.items()
+        }
+
+        if not params:
+            return grads
 
         with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
+            for _ in range(self.n_directions):
+                directions = {
+                    name: self._sample_direction(param)
+                    for name, param in params.items()
+                }
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+                # x + eps*d
+                for name, param in params.items():
+                    param.add_(directions[name], alpha=self.eps)
+                f_plus = float(loss_fn())
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+                # x - eps*d
+                for name, param in params.items():
+                    param.add_(directions[name], alpha=-2.0 * self.eps)
+                f_minus = float(loss_fn())
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+                # Restore x
+                for name, param in params.items():
+                    param.add_(directions[name], alpha=self.eps)
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+                coeff = (f_plus - f_minus) / (2.0 * self.eps)
+
+                # If something numerically bad happens, skip this direction.
+                if not math.isfinite(coeff):
+                    continue
+
+                scale = coeff / float(self.n_directions)
+                for name in params:
+                    grads[name].add_(directions[name], alpha=scale)
 
         return grads
-        # ------------------------------------------------------------------
 
     def _update_params(
         self,
@@ -215,17 +250,51 @@ class ZeroOrderOptimizer:
               - Adam-style: maintain first and second moment estimates.
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
+         if not params:
+            return
+
+        t = self.step_idx + 1
+        updates: dict[str, torch.Tensor] = {}
+
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+                grad = grads[name]
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+                # Defensive cleanup.
+                grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Mild L2 only for weight matrices, not bias.
+                if self.weight_decay > 0.0 and param.ndim > 1:
+                    grad = grad.add(param, alpha=self.weight_decay)
+
+                if name not in self.m:
+                    self.m[name] = torch.zeros_like(param)
+                    self.v[name] = torch.zeros_like(param)
+
+                self.m[name].mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
+                self.v[name].mul_(self.beta2).addcmul_(
+                    grad,
+                    grad,
+                    value=1.0 - self.beta2,
+                )
+
+                m_hat = self.m[name] / (1.0 - self.beta1 ** t)
+                v_hat = self.v[name] / (1.0 - self.beta2 ** t)
+
+                updates[name] = m_hat / (v_hat.sqrt() + self.adam_eps)
+
+            # Global norm over all active update tensors.
+            total_sq = torch.zeros((), device=next(iter(params.values())).device)
+            for update in updates.values():
+                total_sq.add_(update.pow(2).sum())
+
+            total_norm = total_sq.sqrt()
+            clip_scale = 1.0
+            if torch.isfinite(total_norm) and total_norm > self.max_update_norm:
+                clip_scale = float(self.max_update_norm / (total_norm + 1e-12))
+
+            for name, param in params.items():
+                param.add_(updates[name], alpha=-self.lr * clip_scale)
 
     def step(self, loss_fn: Callable[[], float]) -> float:
         """Perform one zero-order optimisation step.
@@ -252,10 +321,15 @@ class ZeroOrderOptimizer:
         """
         params = self._active_params()
 
-        # Record the loss before any perturbation.
         with torch.no_grad():
-            loss_before = loss_fn()
+            loss_before = float(loss_fn())
 
+        grads = self._estimate_grad(loss_fn, params)
+        self._update_params(params, grads)
+
+        self.step_idx += 1
+
+        return float(loss_before)
         grads = self._estimate_grad(loss_fn, params)
         self._update_params(params, grads)
 
