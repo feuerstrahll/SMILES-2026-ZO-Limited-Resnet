@@ -63,7 +63,7 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 5e-2,
+        lr: float = 5e-3,
         eps: float = 1e-3,
         perturbation_mode: str = "rademacher",
     ) -> None:
@@ -250,7 +250,7 @@ class ZeroOrderOptimizer:
               - Adam-style: maintain first and second moment estimates.
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
-         if not params:
+        if not params:
             return
 
         t = self.step_idx + 1
