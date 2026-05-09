@@ -330,7 +330,5 @@ class ZeroOrderOptimizer:
         self.step_idx += 1
 
         return float(loss_before)
-        grads = self._estimate_grad(loss_fn, params)
-        self._update_params(params, grads)
 
         return float(loss_before)
