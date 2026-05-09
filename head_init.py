@@ -29,9 +29,28 @@ def init_last_layer(layer: nn.Linear) -> None:
           - Small-scale init (e.g. scale weights by 0.01) — conservative start
           - Non-zero bias init           — useful when class priors are known
     """
-    # -------------------------------------------------------------------------
-    # STUDENT: Replace or extend the initialization below.
-    # -------------------------------------------------------------------------
-    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
-    nn.init.zeros_(layer.bias)
-    # -------------------------------------------------------------------------
+    """Initialize the final CIFAR100 classification head in-place.
+
+    We use small random weights and zero bias.
+
+    Why:
+    - the new head is randomly initialized;
+    - zero-order optimization is noisy;
+    - too-large initial logits make the loss unstable;
+    - small weights start close to uniform predictions and give a safer
+      starting point for black-box fine-tuning.
+    """
+
+    """Initialize the final CIFAR100 classification head in-place.
+    I use small random weights and zero bias.
+
+    Why:
+    - the new head is randomly initialized;
+    - zero-order optimization is noisy;
+    - too-large initial logits make the loss unstable;
+    - small weights start close to uniform predictions and give a safer
+      starting point for black-box fine-tuning.
+    """
+    with torch.no_grad():
+        nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(layer.bias)

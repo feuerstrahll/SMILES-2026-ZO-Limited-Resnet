@@ -41,19 +41,37 @@ def get_transforms(train: bool) -> T.Compose:
     if train:
         return T.Compose(
             [
-                # ----------------------------------------------------------
-                # STUDENT: Extend the training pipeline below.
-                # Keep the Resize and Normalize steps; add augmentations
-                # between or around them as appropriate.
-                # ----------------------------------------------------------
                 T.Resize(224),
-                T.RandomHorizontalFlip(),
-                # Add more augmentations here ↓
+
+                # Spatial augmentation.
+                # CIFAR100 images are small, so this helps the model avoid
+                # memorizing exact object positions.
+                T.RandomCrop(224, padding=28),
+                T.RandomHorizontalFlip(p=0.5),
+
+                # Mild color augmentation.
+                # Keep it conservative because the compute budget is small.
+                T.ColorJitter(
+                    brightness=0.15,
+                    contrast=0.15,
+                    saturation=0.10,
+                    hue=0.02,
+                ),
+
                 T.ToTensor(),
                 T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
-                # ----------------------------------------------------------
+
+                # Tensor-level augmentation.
+                # Helps generalization, but p should not be too high.
+                T.RandomErasing(
+                    p=0.15,
+                    scale=(0.02, 0.12),
+                    ratio=(0.3, 3.3),
+                    value=0,
+                ),
             ]
         )
+
     else:
         # Fixed validation pipeline — do not modify.
         return T.Compose(
