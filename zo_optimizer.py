@@ -330,5 +330,3 @@ class ZeroOrderOptimizer:
         self.step_idx += 1
 
         return float(loss_before)
-
-        return float(loss_before)
